@@ -3,7 +3,7 @@ cronsync is a bash script for syncing a local repository from Mageia mirrors usi
 When the failure of a first tier mirror almost caused my local repo to be wiped I 
 wrote this little script which does the following:
 
-* Checks the accessibility and file count of the first mirror in the 'mymirrors' variable in the scrit.
+* Checks the accessibility and file count of the first mirror in the 'mymirrors' variable in the script.
 * If the file count on the mirror has dropped by more than a preset limit then other 
   mirrors are checked until a good one (or none) is found.
 
