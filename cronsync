@@ -1,0 +1,250 @@
+#!/bin/bash
+# cronsync by barjac
+###################
+# Description:
+# cronsync is a bash script for syncing a local repository from Mageia mirrors using rsync.
+# When the failure of a first tier mirror almost caused my local repo to be wiped I 
+# wrote this little script which does the following:
+# Checks the accessability and file count of the first mirror in the 'mymirrors' list below.
+# If the file count on the mirror has dropped by more than a preset limit then other 
+# mirrors are checked until a good one (or none) is found.
+# Any failures are reported in ~/cronsync_error.log
+# On finding a good mirror cronsync uses rsync to sync the repo from the mirror.
+# A copy of the last successful update output is saved in ~/cronsync_last.log
+# A list of file counts for all mirrors used is saved in ~/cronsync_file_count.log
+# To run as a cron job use:
+# $ crontab -e
+# ...and set for example:
+# 0 * * * *	$HOME/cronsync  (maybe best to avoid "0" ;)
+###################
+# Configuration:
+# List of mirrors in preference order to use:-
+mymirrors=( \
+"rsync://www.mirrorservice.org/mageia.org/pub/mageia/distrib" \
+"rsync://distrib-coffee.ipsl.jussieu.fr:/pub/linux/Mageia/distrib" \
+"rsync://ftp.acc.umu.se/mirror/mageia/distrib" \
+"rsync://ftp.LinuxCabal.org/Mageia/distrib" \
+"rsync://mirrors.kernel.org:/mirrors/mageia/distrib" \
+)
+# Set limit for loss of files on mirror (since last sync)  before it is skipped
+allowdropfiles=5000
+#
+# Set a minimum # of files that the mirror should have before being accepted the first time the script is run.
+# Note: If you suddenly exclude a large folder you may need to delete ~/.cronsync and set a new start count here.
+# This is ignored after a good sync as the actual file count is stored in ~/.cronsync and updated at each run.
+startfiles=140000
+#
+# rsync --excludes may be set with either syntax in the next two lines:-
+myexcludes=(--exclude=debug --exclude=1 --exclude=2 --exclude=3 --exclude=barjac)
+# myexcludes=(--exclude={debug,SRPMS,barjac})
+#
+# Root of local mirror
+mydestination="/zm-repo/pub/linux/Mageia/"
+#
+# Extra repo location (added/removed on the fly by running cronsync e or cronsync n)
+path_to_extra="/zm-repo/pub/linux/barjac/distrib"
+###################
+# Nothing below here should need modification - hackers only ;)
+###################
+
+# Set minimum files for first run only
+[[ -f .cronsync ]] || echo $startfiles > $HOME/.cronsync
+# Get minimum file count for mirror (set at allowdropfiles files less than the last actual file count)
+lastfiles=$(cat .cronsync)
+((minfiles = $lastfiles - $allowdropfiles))
+
+# Function to output rsync error messages
+rsyncerr()
+{
+case $1 in        
+    0)      
+    echo "Success"; return 0
+	;;
+    1)      
+    echo "Syntax or usage error"; return 0
+	;;
+    2)      
+    echo "Protocol incompatibility"; return 0
+	;;
+    3)      
+    echo "Errors selecting input/output files, dirs"; return 0
+	;;
+    4)      
+    echo "Requested action not supported: an attempt was made to manipulate 64-bit files on a platform \
+that cannot support them, or an option was specified that is supported by the client and not \
+by the server."; return 0
+	;;
+    5)      
+    echo "Error starting client-server protocol"; return 0
+	;;
+    6)      
+    echo "Daemon unable to append to log-file"; return 0
+	;;
+    10)     
+    echo "Error in socket I/O"; return 0
+	;;
+    11)     
+    echo "Error in file I/O"; return 0
+	;;
+    12)     
+    echo "Error in rsync protocol data stream"; return 0
+	;;
+    13)     
+    echo "Errors with program diagnostics"; return 0
+	;;
+    14)     
+    echo "Error in IPC code"; return 0
+	;;
+    20)     
+    echo "Received SIGUSR1 or SIGINT"; return 0
+	;;
+    21)     
+    echo "Some error returned by waitpid()"; return 0
+	;;
+    22)     
+    echo "Error allocating core memory buffers"; return 0
+	;;
+    23)     
+    echo "Partial transfer due to error"; return 0
+	;;
+    24)     
+    echo "Partial transfer due to vanished source files"; return 0
+	;;
+    25)     
+    echo "The --max-delete limit stopped deletions"; return 0
+	;;
+    30)     
+    echo "Timeout in data send/receive"; return 0
+	;;
+    35)     
+    echo "Timeout waiting for daemon connection"; return 0
+	;;
+esac
+}
+
+# Function to output formatted date
+dte()
+{
+echo -n $(date +%d/%m/%Y-%H:%M)
+}
+
+# Check a mirror
+chk_mirror()
+{
+echo "Checking $1 ..."
+rsync -rlptgoDhHSn \
+--stats \
+--delete-after \
+--delete-excluded \
+--protect-args \
+"${myexcludes[@]}" \
+"$1" \
+"$mydestination" > $lockdir/cronsync_tmp_output
+status=$?
+files=$(cat $lockdir/cronsync_tmp_output | grep "Number of files:" | cut -d' ' -f4 | sed s/,//)
+[[ $files -lt $minfiles ]] && echo "$(dte): Only $files/$lastfiles files in $1" | tee -a $HOME/cronsync_error.log
+[[ $status > 0 ]] && echo -e "$(dte): rsync error: $status checking $1\n$(rsyncerr $status)" | tee -a $HOME/cronsync_error.log
+([[ $status = 0 ]] && [[ $files -gt $minfiles ]]) || return 1
+# Save new real file count
+echo $files > $HOME/.cronsync
+echo $(dte): $files >> $HOME/cronsync_files_hist.log
+return 0
+}
+
+# Loop through mirror array checking until one succeeds or all fail
+find_good_mirror()
+{
+for mirr in ${mymirrors[@]}; do
+chk_mirror $mirr && { echo "Found good mirror - $mirr"; return 0; }
+done
+echo "$(dte): Can't find a good mirror - aborting" | tee -a $HOME/cronsync_error.log
+return 1
+}
+
+# add extra repo
+add_extra_repo() {
+for mediacfg in $(find $mydestination -name media.cfg); do
+cat >> $mediacfg <<EOF
+
+[extra/release]
+hdlist=hdlist_extra_release.cz
+name=Extra Release
+media_type=release
+
+EOF
+
+fullpath=$(dirname $(dirname $mediacfg))/extra
+dist=$(echo $fullpath|sed 's/distrib/*/'|cut -d* -f2)
+xtra=$path_to_extra$dist
+echo "Adding $fullpath" | tee -a $HOME/cronsync_last.log
+mkdir -p $xtra
+ln -sf $xtra $fullpath
+done
+}
+
+# remove extra repo
+rem_extra_repo() {
+for mediacfg in $(find $mydestination -name media.cfg); do
+fullpath=$(dirname $(dirname $mediacfg))/extra
+[[ -h $fullpath ]] && { echo "Removing symlink $fullpath" | tee -a $HOME/cronsync_last.log; rm -f $fullpath; }
+echo "Removing Extra entry from $mediacfg"  | tee -a $HOME/cronsync_last.log
+sed -i '/\[extra\/release\]/,$d' $mediacfg 
+done
+}
+
+################### Main routine starts here
+# Avoid running two instances concurrently, some updates can take a long time!
+lockdir=/tmp/cronsync.lock
+if mkdir "$lockdir"; then
+trap 'rm -rf "$lockdir"' 0
+# Check if extra repo needed
+if [[ -f .cronsync_extra ]];then
+    with_extra=1
+else
+    with_extra=
+fi
+
+# Check if only removing extra repo
+if [[ $@ =~ "n" ]]; then
+rem_extra_repo
+exit 0
+fi
+
+# Check if only adding extra repo
+if [[ $@ =~ "e" ]]; then
+add_extra_repo
+exit 0
+fi
+
+# Find a good mirror from the list (with files in it)
+find_good_mirror || exit 1
+
+# Live run with --max-delete set to 5000 just in case ;)
+echo -e "$(dte): Syncing from $mirr ...\n" | tee $HOME/cronsync_last.log
+rsync -rlptgoDhHS \
+--progress \
+--stats \
+--delete-after \
+--max-delete=5000 \
+--delete-excluded \
+--protect-args \
+"${myexcludes[@]}" \
+"$mirr" \
+"$mydestination" | tee -a $HOME/cronsync_last.log
+status=${PIPESTATUS[0]}
+[[ $status = 0 ]] || { echo "$(dte): Live run rsync error: $(rsyncerr $status)" >> $HOME/cronsync_error.log; exit 1; }
+
+# Create symlinked 'extra' media
+if [[ $with_extra = 1 ]]; then
+add_extra_repo
+fi
+
+echo -e "\n$(dte): Update complete" | tee -a $HOME/cronsync_last.log
+echo $(dte): "$mirr $(cat cronsync_last.log | grep ^sent) " >> $HOME/cronsync.log
+else
+
+echo "$(dte): cronsync already running or stale lock - skipping update - check /tmp/cronsync.lock" >> $HOME/cronsync_error.log
+exit 0
+fi
+
+################### End of cronsync
